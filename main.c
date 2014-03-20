@@ -7,8 +7,7 @@
 
 #include "ems.h"
 
-// don't forget to bump this :P
-#define VERSION "0.04 Secure"
+#define VERSION "0.05"
 
 // one bank is 32 megabits
 #define BANK_SIZE 0x400000
@@ -158,7 +157,7 @@ void get_options(int argc, char **argv) {
             case 'b':
                 optval = atoi(optarg);
                 if (optval < 1 || optval > 2) {
-                    printf("Error: cart only has two banks 1 and 2\n");
+                    printf("Error: cart only has two banks: 1 and 2\n");
                     usage(argv[0]);
                 }
                 opts.bank = optval - 1;
@@ -203,8 +202,109 @@ mode_error:
     usage(argv[0]);
 
 mode_error2:
-    printf("Error: must supply zero or one of --sram, or --rom\n");
+    printf("Error: must supply zero or one of --save, or --rom\n");
     usage(argv[0]);
+}
+
+/**
+ * header_info
+ */
+void header_info(unsigned char* buf) {
+    int i;
+    int willboot = 2;
+
+    printf("\tTitle: ");
+    if(buf[HEADER_TITLE] == 0)
+        printf("NONE");
+    for(i = HEADER_TITLE; i < (HEADER_TITLE + 16); i++) {
+        if(buf[i] == 0)
+            break;
+        putchar(buf[i]);
+    }
+    printf("\n");
+
+    printf("\tNintendo logo: ");
+    for(i = 0; i < 0x30; ++i) {
+        if((unsigned char) nintylogo[i] != buf[HEADER_LOGO + i])
+            break;
+    }
+    if(i == 0x30) {
+        printf("PASS\n");
+    } else if(i > 0x18) {
+        printf("FAIL, but will boot on CGB\n");
+        willboot = 1;
+    } else {
+        printf("FAIL\n");
+        willboot = 0;
+    }
+
+    printf("\tHardware support: ");
+    if ((buf[HEADER_CGBFLAG] & 128) && (buf[HEADER_CGBFLAG] & 64)) {
+        printf("CGB\n");
+    } else if ((buf[HEADER_CGBFLAG] & 128) && (buf[HEADER_CGBFLAG] & 64) && buf[HEADER_SGBFLAG] == 0x03) {
+        printf("CGB <+SGB>, not real option set\n");
+    } else if ((buf[HEADER_CGBFLAG] & 128) && buf[HEADER_SGBFLAG] == 0x03) {
+        printf("DMG <+CGB, +SGB>\n");
+    } else if ((buf[HEADER_CGBFLAG] & 128)) {
+        printf("DMG <+CGB>\n");
+    } else if (buf[HEADER_SGBFLAG] == 0x03) {
+        printf("DMG <+SGB>\n");
+    } else {
+        printf("DMG\n");
+    }
+
+    printf("\tHeader checksum: ");
+    uint8_t calculated_chk = 0;
+    for (i = HEADER_TITLE; i <= HEADER_CHKSUM; ++i) {
+        calculated_chk += buf[i];
+    }
+    calculated_chk += 25;
+
+    if (calculated_chk != 0) {
+        printf("FAIL\n");
+        willboot = 0;
+    } else {
+        printf("PASS\n");
+    }
+
+    printf("\tRom size: ");
+    switch (buf[HEADER_ROMSIZE]) {
+        case 0:
+        case 1:
+        case 2:
+        case 3:
+        case 4:
+        case 5:
+        case 6:
+        case 7:
+            printf("%u KB ROM\n", 32 << buf[HEADER_ROMSIZE]);
+            break;
+        case 0x52:
+            printf("1152 KB ROM\n");
+            break;
+        case 0x53:
+            printf("1280 KB ROM\n");
+            break;
+        case 0x54:
+            printf("1536 KB ROM\n");
+            break;
+        default:
+            printf("Unknown ROM size code\n");
+            break;
+    }
+
+    printf("\tBoot status: ");
+    switch(willboot) {
+        case 0:
+            printf("This game will not boot on any system.\n");
+            break;
+        case 1:
+            printf("This game will only boot on CGB.\n");
+            break;
+        default:
+            printf("This game will work on any system.\n");
+            break;
+    }   
 }
 
 /**
@@ -219,21 +319,21 @@ int main(int argc, char **argv) {
     opts.verbose = 1;
 
     if (opts.verbose)
-        printf("trying to find EMS cart\n");
+        printf("Trying to find EMS cart\n");
 
     r = ems_init();
     if (r < 0)
         return 1;
 
     if (opts.verbose)
-        printf("claimed EMS cart\n");
+        printf("Claimed EMS cart\n");
 
     // we'll need a buffer one way or another
     int blocksize = opts.blocksize;
     uint32_t offset = 0;
     uint32_t base = opts.bank * BANK_SIZE;
     if (opts.verbose)
-        printf("base address is 0x%X\n", base);
+        printf("Base address is 0x%X\n", base);
     
     unsigned char *buf = malloc(blocksize);
     if (buf == NULL)
@@ -267,18 +367,48 @@ int main(int argc, char **argv) {
         else if (opts.verbose)
             printf("Saving SAVE into %s\n", opts.file);
 
-        while ((int)(offset + blocksize) <= limits[space]) {
+        unsigned int readuntil = limits[space];
+        int untilset = 0;
+        while ((int)(offset + blocksize) <= readuntil) {
             r = ems_read(space, offset + base, buf, blocksize);
             if (r < 0) {
-                warnx("can't read %d bytes at offset %u\n", blocksize, offset);
+                warnx("Can't read %d bytes at offset %u\n", blocksize, offset);
                 return 1;
             }
 
             r = fwrite(buf, blocksize, 1, save_file);
             if (r != 1)
-                err(1, "can't write %d bytes into file at offset %u", blocksize, offset);
+                err(1, "Can't write %d bytes into file at offset %u", blocksize, offset);
 
             offset += blocksize;
+            printf("Saving: %.2f%%\r", ((float) offset / (float) readuntil) * 100);
+
+            if(offset >= HEADER_ROMSIZE && untilset == 0 && space == FROM_ROM) {
+                switch(buf[HEADER_ROMSIZE - (offset - blocksize)]) {
+                    case 0:
+                    case 1:
+                    case 2:
+                    case 3:
+                    case 4:
+                    case 5:
+                    case 6:
+                    case 7:
+                        readuntil = (32 << buf[HEADER_ROMSIZE - (offset - blocksize)]) * 1024;
+                        break;
+                    case 0x52:
+                        readuntil = 1152 * 1024;
+                        break;
+                    case 0x53:
+                        readuntil = 1280 * 1024;
+                        break;
+                    case 0x54:
+                        readuntil = 1536 * 1024;
+                        break;
+                    default:
+                        break;
+                }
+                untilset = 1;
+            }
         }
 
         fclose(save_file);
@@ -315,153 +445,40 @@ int main(int argc, char **argv) {
         while ((int)(offset + blocksize) <= limits[space] && fread(buf, blocksize, 1, write_file) == 1) {
             r = ems_write(space, offset + base, buf, blocksize);
             if (r < 0) {
-                warnx("can't write %d bytes at offset %u", blocksize, offset);
+                warnx("Can't write %d bytes at offset %u", blocksize, offset);
                 return 1;
             }
 
             offset += blocksize;
+            printf("Writing: %.2f%%\r", ((float) offset / (float) size) * 100);
         }
 
         fclose(write_file);
 
         if (opts.verbose)
-            printf("Successfully wrote %u from %s\n", offset, opts.file);
+            printf("Successfully wrote %u bytes from %s\n", offset, opts.file);
     }
 
     // read the ROM header
     else if (opts.mode == MODE_TITLE) {
         unsigned char buf[512];
-        int i;
 
         r = ems_read(FROM_ROM, 0, buf, 512);
         if (r < 0)
             errx(1, "Couldn't read ROM header at bank 0, offset 0, len 512\n");
         
-        printf("Bank 0: ");
-        for (i = HEADER_TITLE; i < (HEADER_TITLE + 16); i++) {
-            putchar(buf[i]);
-        }
-        printf("\nHardware support: ");
+        printf("Bank 0: \n");
+        header_info(buf);
 
-        if ((buf[HEADER_CGBFLAG] & 128) && (buf[HEADER_CGBFLAG] & 64)) {
-            printf("CGB\n");
-        } else if ((buf[HEADER_CGBFLAG] & 128) && (buf[HEADER_CGBFLAG] & 64) && buf[HEADER_SGBFLAG] == 0x03) {
-            printf("CGB <+SGB>, not real option set\n");
-        } else if ((buf[HEADER_CGBFLAG] & 128) && buf[HEADER_SGBFLAG] == 0x03) {
-            printf("DMG <+CGB, +SGB>\n");
-        } else if ((buf[HEADER_CGBFLAG] & 128)) {
-            printf("DMG <+CGB>\n");
-        } else if (buf[HEADER_SGBFLAG] == 0x03) {
-            printf("DMG <+SGB>\n");
-        } else {
-            printf("DMG\n");
-        }
-
-        //Verify cartridge header checksum while we're at it
-        uint8_t calculated_chk = 0;
-        for (i = HEADER_TITLE; i < HEADER_CHKSUM; i++) {
-            calculated_chk -= buf[i] - 1;
-        }
-
-        if (calculated_chk != buf[HEADER_CHKSUM]) {
-            printf("Cartridge header checksum invalid. This game will NOT boot on real hardware.\n");
-        }
-
-        if (buf[HEADER_SGBFLAG] == 0x03 && buf[HEADER_OLDLICENSEE] != 0x33) {
-            printf("SGB functions were enabled, but Old Licensee field is not set to 33h. This game will not be able to use SGB functions on real hardware.\n");
-        }
-
-        if (opts.verbose) {
-            switch (buf[HEADER_ROMSIZE]) {
-                case 0:
-                case 1:
-                case 2:
-                case 3:
-                case 4:
-                case 5:
-                case 6:
-                case 7:
-                    printf("%u KB ROM\n", 32 << buf[HEADER_ROMSIZE]);
-                    break;
-                case 0x52:
-                    printf("1152 KB ROM\n");
-                    break;
-                case 0x53:
-                    printf("1280 KB ROM\n");
-                    break;
-                case 0x54:
-                    printf("1536 KB ROM\n");
-                    break;
-                default:
-                    printf("Unknown ROM size code\n");
-                    break;
-            }
-        }
+        // readability.
+        printf("\n");
 
         r = ems_read(FROM_ROM, BANK_SIZE, (unsigned char *)buf, 512);
         if (r < 0)
             errx(1, "Couldn't read ROM header at bank 1, offset 0, len 512\n");
         
-        printf("Bank 1: ");
-        for (i = HEADER_TITLE; i < (HEADER_TITLE + 16); i++) {
-            putchar(buf[i]);
-        }
-        printf("\nHardware support: ");
-
-        if (buf[HEADER_CGBFLAG] == 0x80 && buf[HEADER_SGBFLAG] == 0x03) {
-            printf("CGB enhanced, SGB enhanced, DMG compatible\n");
-        } else if (buf[HEADER_CGBFLAG] == 0x80) {
-            printf("CGB enhanced, DMG compatible\n");
-        } else if (buf[HEADER_CGBFLAG] == 0xC0) {
-            printf("CGB only\n");
-        } else if (buf[HEADER_CGBFLAG] == 0xC0 && buf[HEADER_SGBFLAG] == 0x03) {
-            printf("CGB only, SGB enhanced (not a real set of options)\n");
-        } else if (buf[HEADER_SGBFLAG] == 0x03) {
-            printf("DMG, SGB enhanced\n");
-        } else {
-            printf("DMG\n");
-        }
-
-        //Verify cartridge header checksum while we're at it
-        calculated_chk = 0;
-        for (i = HEADER_TITLE; i < HEADER_CHKSUM; i++) {
-            calculated_chk -= buf[i] - 1;
-        }
-
-        if (calculated_chk != buf[HEADER_CHKSUM]) {
-            printf("Cartridge header checksum invalid. This game will NOT boot on real hardware.\n");
-        }
-
-        if (buf[HEADER_SGBFLAG] == 0x03 && buf[HEADER_OLDLICENSEE] != 0x33) {
-            printf("SGB functions were enabled, but Old Licensee field is not set to 33h. This game will not be able to use SGB functions on real hardware.\n");
-        }
-
-        if (opts.verbose) {
-            switch (buf[HEADER_ROMSIZE]) {
-                case 0:
-                case 1:
-                case 2:
-                case 3:
-                case 4:
-                case 5:
-                case 6:
-                case 7:
-                    printf("%u KB ROM\n", 32 << buf[HEADER_ROMSIZE]);
-                    break;
-                case 0x52:
-                    printf("1152 KB ROM\n");
-                    break;
-                case 0x53:
-                    printf("1280 KB ROM\n");
-                    break;
-                case 0x54:
-                    printf("1536 KB ROM\n");
-                    break;
-                default:
-                    printf("Unknown ROM size code\n");
-                    break;
-            }
-        }
+        printf("Bank 1: \n");
+        header_info(buf);
     }
 
     // should never reach here

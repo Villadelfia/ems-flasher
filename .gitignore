@@ -1,1 +1,3 @@
 .clang_complete
+*.o
+ems-flasher
