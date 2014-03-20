@@ -312,6 +312,7 @@ void header_info(unsigned char* buf) {
  */
 int main(int argc, char **argv) {
     int r;
+    setbuf(stdout, NULL);
 
     get_options(argc, argv);
 
